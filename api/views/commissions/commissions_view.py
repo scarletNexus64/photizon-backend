@@ -19,7 +19,7 @@ def create_commission(request):
 
 
 @api_view(["GET"])
-# @permission_classes([IsAuthenticatedUser, IsSuperAdmin])
+@permission_classes([IsAuthenticatedUser])
 def list_commissions(request):
     commissions = Commission.objects.all()
     serializer = CommissionSerializer(commissions, many=True)
@@ -147,6 +147,26 @@ def add_member_to_commission(request, church_id, commission_id):
 
     serializer = ChurchCommissionSerializer(obj)
     return Response(serializer.data)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticatedUser])
+def join_commission(request, church_id, commission_id):
+    church = get_object_or_404(Church, id=church_id)
+    commission = get_object_or_404(Commission, id=commission_id)
+
+    if str(request.user.current_church_id) != str(church.id) and request.user.role != "SADMIN":
+        return Response({"detail": "You must belong to this church."}, status=403)
+
+    obj, created = ChurchCommission.objects.get_or_create(
+        church=church,
+        commission=commission,
+        user=request.user,
+        defaults={"role": "MEMBER"},
+    )
+
+    serializer = ChurchCommissionSerializer(obj)
+    return Response(serializer.data, status=201 if created else 200)
 
 @api_view(["DELETE"])
 @permission_classes([IsAuthenticatedUser])

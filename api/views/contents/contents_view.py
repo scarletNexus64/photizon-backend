@@ -2,7 +2,7 @@ from django.shortcuts import get_object_or_404
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework import status
-from django.db.models import Q,F, Count
+from django.db.models import Q, F, Count, Exists, OuterRef, Value
 from django.utils.text import slugify
 from api.permissions import IsAuthenticatedUser, IsSuperAdmin, user_is_church_admin
 from api.serializers import CategorySerializer, CommentSerializer, ContentCreateUpdateSerializer, ContentDetailSerializer, ContentListSerializer, PlaylistItemSerializer, PlaylistSerializer, TagSerializer, ContentNotificationSerializer, ContentComingSoonSerializer
@@ -20,7 +20,7 @@ import random
 # tes modèles (adaptés à ton projet)
 from api.models import (
     ChurchAdmin, Content, Category, Tag, ContentTag, Playlist, PlaylistItem,
-    ContentView, ContentLike, Comment, Church, User, ContentNotification
+    ContentView, ContentLike, Comment, Church, User, ContentNotification, Notification
 )
 from api.models import TicketType
 from api.serializers import TicketTypeSerializer
@@ -30,6 +30,10 @@ from api.permissions import IsAuthenticatedUser
 from django.utils import timezone
 from datetime import timedelta
 from itertools import zip_longest
+from api.services.notification_preferences import (
+    build_in_app_notifications,
+    create_in_app_notification,
+)
 
 
 def exclude_coming_soon(queryset):
@@ -44,8 +48,85 @@ def exclude_coming_soon(queryset):
     )
 
 
+def annotate_content_metrics(queryset, user=None):
+    """
+    Annoter les contenus avec des métriques légères pour le feed
+    (likes, commentaires, vues, et is_liked pour l'utilisateur courant).
+    """
+    qs = queryset.annotate(
+        likes_count=Count("contentlike", distinct=True),
+        comments_count=Count("comment", distinct=True),
+        views_count=Count("contentview", distinct=True),
+    )
+
+    if user is not None and getattr(user, "is_authenticated", False):
+        qs = qs.annotate(
+            is_liked=Exists(
+                ContentLike.objects.filter(content_id=OuterRef("pk"), user=user)
+            )
+        )
+    else:
+        qs = qs.annotate(is_liked=Value(False, output_field=models.BooleanField()))
+
+    return qs
+
+
+def _user_can_view_church_scope(user, church):
+    if getattr(user, "role", None) == "SADMIN":
+        return True
+    if getattr(user, "current_church_id", None) == church.id:
+        return True
+    return ChurchAdmin.objects.filter(user=user, church=church).exists()
+
+
+def _user_can_manage_church_library(user, church):
+    if getattr(user, "role", None) == "SADMIN":
+        return True
+    return ChurchAdmin.objects.filter(
+        user=user,
+        church=church,
+        role__in=["OWNER", "ADMIN"],
+    ).exists()
+
+
+def _build_content_notification_meta(content, *, action, actor=None, extra=None):
+    meta = {
+        "content_id": str(content.id),
+        "content_type": content.type,
+        "content_title": content.title,
+        "church_id": str(content.church_id),
+        "interaction_type": action,
+    }
+    if actor is not None:
+        meta["actor_id"] = str(actor.id)
+        meta["actor_name"] = actor.name
+    if extra:
+        meta.update(extra)
+    return meta
+
+
+def _notify_content_owner(content, *, actor, title, message, action, extra=None):
+    owner = content.created_by
+    if owner is None or owner.id == actor.id:
+        return
+
+    create_in_app_notification(
+        user=owner,
+        title=title,
+        message=message,
+        notif_type="INFO",
+        category="social",
+        meta=_build_content_notification_meta(
+            content,
+            action=action,
+            actor=actor,
+            extra=extra,
+        ),
+    )
+
+
 @api_view(["POST"])
-# @permission_classes([IsSuperAdmin])
+@permission_classes([IsSuperAdmin])
 def create_category(request):
     data = request.data.copy()
     if "name" in data:
@@ -88,14 +169,14 @@ def update_category(request, category_id):
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 @api_view(["DELETE"])
-@permission_classes([IsAuthenticatedUser])
+@permission_classes([IsSuperAdmin])
 def delete_category(request, category_id):
     category = get_object_or_404(Category, id=category_id)
     category.delete()
     return Response({"detail": "Category deleted successfully"})
 
 class DefaultPagination(PageNumberPagination):
-    page_size = 12
+    page_size = 10
     page_size_query_param = "page_size"
     max_page_size = 100
 
@@ -146,11 +227,21 @@ def list_content(request):
     # Exclure les contenus coming soon
     qs = exclude_coming_soon(qs)
 
-    # annotate likes & views for ordering if requested
-    qs = qs.annotate(likes_count=Count("contentlike"), views_count=Count("contentview"))
+    qs = qs.select_related("church", "created_by", "category").prefetch_related(
+        "contenttag_set__tag"
+    )
+    qs = annotate_content_metrics(qs, request.user)
 
     ordering = request.GET.get("ordering")
     if ordering:
+        prefix = "-" if ordering.startswith("-") else ""
+        normalized = ordering.lstrip("-")
+        if normalized == "likes":
+            ordering = f"{prefix}likes_count"
+        elif normalized == "views":
+            ordering = f"{prefix}views_count"
+        elif normalized == "comments":
+            ordering = f"{prefix}comments_count"
         qs = qs.order_by(ordering)
     else:
         qs = qs.order_by("-created_at")
@@ -180,15 +271,20 @@ def retrieve_content(request, content_id):
     return Response(serializer.data)
 
 
+from django.core.files.storage import default_storage
+
 @api_view(["POST"])
-# @permission_classes([IsAuthenticatedUser])
+@permission_classes([IsAuthenticatedUser])
 def create_content(request,church_id):
     church = get_object_or_404(Church, id=church_id)
     if not getattr(church, "is_verified", False):
         return Response({"detail": "Church not verified"}, status=403)
-    # Only church admins/owner or SADMIN can create for other churches (we assume check)
-    # if not user_is_church_admin(request.user, church):
-    #     return Response({"detail":"Forbidden"}, status=403)
+    requested_type = request.data.get("type")
+    is_member_story = (
+        requested_type == "STORY" and request.user.current_church_id == church.id
+    )
+    if not user_is_church_admin(request.user, church) and not is_member_story:
+        return Response({"detail":"Forbidden"}, status=403)
     data = request.data.copy()
     # created_by set to request.user
     data["created_by"] = request.user.id
@@ -198,7 +294,24 @@ def create_content(request,church_id):
         category = get_object_or_404(Category, id=category_value)
         data["category"] = category.id
     if not data.get("slug"):
-        data["slug"] = slugify(data["title"])
+        data["slug"] = slugify(data.get("title", ""))
+
+    if "file" in request.FILES:
+        uploaded_file = request.FILES["file"]
+        file_name = default_storage.save(f"uploads/{uploaded_file.name}", uploaded_file)
+        file_url = request.build_absolute_uri(default_storage.url(file_name))
+        data["file"] = file_url
+        content_type = getattr(uploaded_file, "content_type", "") or ""
+        if content_type.startswith("audio/") and not data.get("audio_url"):
+            data["audio_url"] = file_url
+        elif content_type.startswith("video/") and not data.get("video_url"):
+            data["video_url"] = file_url
+        if (
+            content_type.startswith("image/")
+            and not data.get("cover_image_url")
+        ):
+            data["cover_image_url"] = file_url
+        
     serializer = ContentCreateUpdateSerializer(data=data)
     if serializer.is_valid():
         content = serializer.save()
@@ -210,6 +323,38 @@ def create_content(request,church_id):
             for t in tags:
                 tag_obj, _ = Tag.objects.get_or_create(name=t, defaults={"slug": t.lower().replace(" ","-")})
                 ContentTag.objects.get_or_create(content=content, tag=tag_obj)
+        should_notify_members = (
+            getattr(content, "published", False)
+            and content.type in {"EVENT", "POST", "ARTICLE", "VIDEO", "AUDIO", "BOOK"}
+        )
+        if should_notify_members:
+            recipients = User.objects.filter(current_church=church).exclude(id=request.user.id)
+            if content.type == "EVENT":
+                notif_title = f"Nouvel evenement: {content.title}"
+                notif_message = (
+                    f"{church.title} a publie un nouvel evenement"
+                    + (f" a {content.location}" if content.location else "")
+                    + "."
+                )
+            else:
+                notif_title = f"Nouveau contenu: {content.title}"
+                notif_message = f"{church.title} a publie un nouveau contenu."
+
+            notifications = build_in_app_notifications(
+                recipients,
+                title=notif_title,
+                message=notif_message,
+                notif_type="SUCCESS",
+                category="content",
+                meta={
+                    "content_id": str(content.id),
+                    "content_type": content.type,
+                    "church_id": str(church.id),
+                    "is_public": bool(content.is_public),
+                },
+            )
+            if notifications:
+                Notification.objects.bulk_create(notifications)
         return Response(ContentDetailSerializer(content).data, status=201)
     return Response(serializer.errors, status=400)
 
@@ -244,19 +389,39 @@ def delete_content(request, content_id):
 @permission_classes([IsAuthenticatedUser])
 def toggle_like_content(request, content_id):
     content = get_object_or_404(Content, id=content_id)
-    like_qs = ContentLike.objects.filter(user=request.user, content=content)
-    
-    if like_qs.exists():
-        # Supprimer le like existant
-        like_qs.delete()
-        return Response({"liked": False, "note": "like removed"})
+    like = ContentLike.objects.filter(user=request.user, content=content).first()
+    if like:
+        like.delete()
+        liked = False
     else:
-        # Créer un nouveau like
         ContentLike.objects.create(user=request.user, content=content)
-        return Response({"liked": True, "note": "like added"})
+        liked = True
+        _notify_content_owner(
+            content,
+            actor=request.user,
+            title=f"Nouveau like sur {content.title}",
+            message=f"{request.user.name} a aime votre contenu.",
+            action="LIKE",
+        )
 
+    return Response({
+        "liked": liked,
+        "likes_count": ContentLike.objects.filter(content=content).count(),
+    })
 
-
+@api_view(["POST"])
+@permission_classes([IsAuthenticatedUser])
+def report_content(request, content_id):
+    # Dummy implementation for reporting
+    content = get_object_or_404(Content, id=content_id)
+    reason = request.data.get("reason", "Pas de raison")
+    return Response(
+        {
+            "reported": True,
+            "content_id": str(content.id),
+            "reason": reason,
+        }
+    )
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticatedUser])
@@ -264,6 +429,25 @@ def view_content(request, content_id):
     content = get_object_or_404(Content, id=content_id)
     # Create a new view record on each call so a user can view multiple times (YouTube-like)
     ContentView.objects.create(user=request.user, content=content)
+    source = request.data.get("source")
+    if source == "SHARE":
+        _notify_content_owner(
+            content,
+            actor=request.user,
+            title=f"Contenu partage: {content.title}",
+            message=f"{request.user.name} a partage votre contenu.",
+            action="SHARE",
+            extra={"source": source},
+        )
+    elif source == "STORY_SHARE":
+        _notify_content_owner(
+            content,
+            actor=request.user,
+            title=f"Partage en story: {content.title}",
+            message=f"{request.user.name} a partage votre contenu en story.",
+            action="STORY_SHARE",
+            extra={"source": source},
+        )
     return Response({"viewed": True})
 
 @api_view(["GET"])
@@ -283,6 +467,14 @@ def add_comment(request, content_id):
         return Response({"error":"text required"}, status=400)
     content = get_object_or_404(Content, id=content_id)
     c = Comment.objects.create(user=request.user, content=content, text=text)
+    _notify_content_owner(
+        content,
+        actor=request.user,
+        title=f"Nouveau commentaire sur {content.title}",
+        message=f"{request.user.name} a commente votre contenu.",
+        action="COMMENT",
+        extra={"comment_id": str(c.id)},
+    )
     return Response(CommentSerializer(c).data, status=201)
 
 @api_view(["DELETE"])
@@ -350,6 +542,8 @@ def create_playlist(request):
     church = get_object_or_404(Church, id=church_id)
     if not getattr(church, "is_verified", False):
         return Response({"detail": "Church not verified"}, status=403)
+    if not _user_can_manage_church_library(request.user, church):
+        return Response({"detail": "Forbidden"}, status=403)
 
     # Use serializer for validation but pass the actual Church instance on save
     serializer = PlaylistSerializer(data=data)
@@ -362,6 +556,8 @@ def create_playlist(request):
 @permission_classes([IsAuthenticatedUser])
 def add_to_playlist(request, playlist_id):
     playlist = get_object_or_404(Playlist, id=playlist_id)
+    if not _user_can_manage_church_library(request.user, playlist.church):
+        return Response({"detail": "Forbidden"}, status=403)
     content_id = request.data.get("content_id")
     pos = request.data.get("position", 0)
 
@@ -369,6 +565,11 @@ def add_to_playlist(request, playlist_id):
         return Response({"detail": "content_id is required"}, status=400)
 
     content = get_object_or_404(Content, id=content_id)
+    if content.church_id != playlist.church_id:
+        return Response(
+            {"detail": "Content must belong to the same church as the playlist"},
+            status=400,
+        )
 
     # Vérifie si le contenu est déjà dans la playlist
     item, created = PlaylistItem.objects.get_or_create(
@@ -389,6 +590,8 @@ def reorder_playlist_item(request, item_id):
     # Récupère l'item
     item = get_object_or_404(PlaylistItem, id=item_id)
     playlist = item.playlist
+    if not _user_can_manage_church_library(request.user, playlist.church):
+        return Response({"detail": "Forbidden"}, status=403)
 
     # Récupère le nouveau rang demandé
     try:
@@ -423,17 +626,14 @@ def trending_content(request, church_id):
     
     # Exclure les coming soon AVANT de scorer/trier
     qs = exclude_coming_soon(qs)
-    
-    qs = (
-        qs.annotate(
-            likes_count=Count("contentlike", distinct=True),
-            views_count=Count("contentview", distinct=True),
-        )
-        .annotate(
-            score=F("views_count") + F("likes_count") * 2
-        )
-        .order_by("-score")[:20]
+
+    qs = annotate_content_metrics(
+        qs.select_related("church", "created_by", "category").prefetch_related(
+            "contenttag_set__tag"
+        ),
+        request.user,
     )
+    qs = qs.annotate(score=F("views_count") + F("likes_count") * 2).order_by("-score")[:20]
 
     serializer = ContentListSerializer(qs, many=True)
     return Response(serializer.data)
@@ -453,10 +653,13 @@ def recommend_for_user(request,church_id):
     if not last_content_ids:
         qs = Content.objects.filter(church_id=church_id, published=True, is_public=True)
         qs = exclude_coming_soon(qs)
-        qs = (
-            qs.annotate(views_count=Count("contentview"), likes_count=Count("contentlike"))
-            .order_by("-views_count", "-likes_count")[:20]
+        qs = annotate_content_metrics(
+            qs.select_related("church", "created_by", "category").prefetch_related(
+                "contenttag_set__tag"
+            ),
+            request.user,
         )
+        qs = qs.order_by("-views_count", "-likes_count")[:20]
         serializer = ContentListSerializer(qs, many=True)
         return Response(serializer.data)
 
@@ -481,14 +684,14 @@ def recommend_for_user(request,church_id):
     # Exclure les coming soon AVANT d'annoter
     candidates = exclude_coming_soon(candidates)
     
-    candidates = (
-        candidates.annotate(
-            tag_matches=Count("contenttag", filter=Q(contenttag__tag_id__in=tag_ids)),
-            views_count=Count("contentview", distinct=True),
-            likes_count=Count("contentlike", distinct=True),
-        )
-        .distinct()
-    )
+    candidates = annotate_content_metrics(
+        candidates.select_related("church", "created_by", "category").prefetch_related(
+            "contenttag_set__tag"
+        ),
+        request.user,
+    ).annotate(
+        tag_matches=Count("contenttag", filter=Q(contenttag__tag_id__in=tag_ids))
+    ).distinct()
 
     # Score simple: prefer contenus avec plus de matching tags, puis vues, puis likes
     qs = candidates.order_by("-tag_matches", "-views_count", "-likes_count")[:20]
@@ -502,6 +705,12 @@ def feed_for_church(request, church_id):
     # Respecter uniquement les contenus publiés et publics (et pas coming soon)
     base_qs = Content.objects.filter(church_id=church_id, published=True, is_public=True)
     base_qs = exclude_coming_soon(base_qs)
+    base_qs = annotate_content_metrics(
+        base_qs.select_related("church", "created_by", "category").prefetch_related(
+            "contenttag_set__tag"
+        ),
+        request.user,
+    )
 
     # Derniers contenus (récent)
     latest = list(base_qs.order_by("-created_at")[:30])
@@ -580,7 +789,16 @@ def list_all_playlists(request):
     )
     church_id = request.GET.get("church_id")
     if church_id:
+       church = get_object_or_404(Church, id=church_id)
+       if not _user_can_view_church_scope(request.user, church):
+           return Response({"detail": "Forbidden"}, status=403)
        qs = qs.filter(church_id=church_id)
+    elif request.user.role != "SADMIN":
+       visible_church_ids = {request.user.current_church_id} if request.user.current_church_id else set()
+       visible_church_ids.update(
+           ChurchAdmin.objects.filter(user=request.user).values_list("church_id", flat=True)
+       )
+       qs = qs.filter(church_id__in=visible_church_ids)
 
     serializer = PlaylistSerializer(qs, many=True)
     return Response(serializer.data)
@@ -589,6 +807,8 @@ def list_all_playlists(request):
 @permission_classes([IsAuthenticatedUser])
 def get_playlist_with_items(request, playlist_id):
     playlist = get_object_or_404(Playlist, id=playlist_id)
+    if not _user_can_view_church_scope(request.user, playlist.church):
+        return Response({"detail": "Forbidden"}, status=403)
     serializer = PlaylistSerializer(playlist)
     return Response(serializer.data)
 
@@ -663,10 +883,10 @@ def church_feed(request, church_id):
     - Seulement les contenus publics ET publiés des églises collaboratrices
     
     Query params:
-    - limit: nombre de contenus par requête (défaut 20)
+    - limit: nombre de contenus par requête (défaut 10)
     - offset: position de départ (défaut 0)
     
-    Utilisation : GET /api/church/<id>/feed/?limit=20&offset=0
+    Utilisation : GET /api/church/<id>/feed/?limit=10&offset=0
     """
     try:
         church = Church.objects.get(id=church_id)
@@ -740,22 +960,33 @@ def church_feed(request, church_id):
     ).select_related(
         'church', 'category', 'created_by'
     ).prefetch_related(
-        'tags'
+        'contenttag_set__tag'
     ).order_by('-created_at').distinct()
     
     # Exclure les contenus coming soon
     all_contents = exclude_coming_soon(all_contents)
+
+    # Filtrer par type de contenu si demandé (ex: POST, ARTICLE, EVENT, AUDIO...)
+    content_type = request.query_params.get("type")
+    if content_type:
+        all_contents = all_contents.filter(type=content_type)
+    else:
+        # If no type specified, exclude stories from the main feed
+        all_contents = all_contents.exclude(type="STORY")
+
+    all_contents = annotate_content_metrics(all_contents, request.user)
     
     # Pagination infinie (offset/limit)
     try:
-        limit = int(request.query_params.get('limit', 20))
+        limit = int(request.query_params.get('limit', 10))
         offset = int(request.query_params.get('offset', 0))
     except ValueError:
-        limit = 20
+        limit = 10
         offset = 0
     
     # Limiter le limit à 100 pour éviter les abus
-    limit = min(limit, 100)
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
     
     total_count = all_contents.count()
     paginated_contents = all_contents[offset:offset + limit]
@@ -804,6 +1035,7 @@ def list_coming_soon(request, church_id):
         planned_release_date__isnull=False,
         planned_release_date__gt=timezone.now()
     ).select_related('church', 'category', 'created_by').order_by('planned_release_date')
+    coming_soon = annotate_content_metrics(coming_soon, request.user)
     
     # Filtrer par type
     content_type = request.query_params.get('type')
@@ -812,13 +1044,14 @@ def list_coming_soon(request, church_id):
     
     # Pagination
     try:
-        limit = int(request.query_params.get('limit', 20))
+        limit = int(request.query_params.get('limit', 10))
         offset = int(request.query_params.get('offset', 0))
     except ValueError:
-        limit = 20
+        limit = 10
         offset = 0
     
-    limit = min(limit, 100)
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
     total_count = coming_soon.count()
     paginated_contents = coming_soon[offset:offset + limit]
     
@@ -921,13 +1154,14 @@ def get_my_subscriptions(request):
     
     # Pagination
     try:
-        limit = int(request.query_params.get('limit', 20))
+        limit = int(request.query_params.get('limit', 10))
         offset = int(request.query_params.get('offset', 0))
     except ValueError:
-        limit = 20
+        limit = 10
         offset = 0
     
-    limit = min(limit, 100)
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
     total_count = subscriptions.count()
     paginated_subs = subscriptions[offset:offset + limit]
     
@@ -974,13 +1208,14 @@ def get_content_subscribers(request, content_id):
     
     # Pagination
     try:
-        limit = int(request.query_params.get('limit', 20))
+        limit = int(request.query_params.get('limit', 10))
         offset = int(request.query_params.get('offset', 0))
     except ValueError:
-        limit = 20
+        limit = 10
         offset = 0
     
-    limit = min(limit, 100)
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
     total_count = subscribers.count()
     paginated_subscribers = subscribers[offset:offset + limit]
     

@@ -99,45 +99,44 @@ class Church(models.Model):
     
     @property
     def phone_number(self):
-        """Backward-compatible single phone_number property: first non-empty number."""
+        """Cached property for first non-empty phone number."""
+        if hasattr(self, '_cached_phone_number'):
+            return self._cached_phone_number
+        
         for n in (self.phone_number_1, self.phone_number_2, self.phone_number_3, self.phone_number_4):
             if n:
+                self._cached_phone_number = n
                 return n
+        self._cached_phone_number = None
         return None
 
     def phone_numbers(self):
-        """Return a list of phone numbers (non-empty)."""
+        """Return a list of non-empty phone numbers."""
         return [n for n in (self.phone_number_1, self.phone_number_2, self.phone_number_3, self.phone_number_4) if n]
+
     def save(self, *args, **kwargs):
-        if not self.slug:
-            self.slug = slugify(self.title)
+        # Always update slug from title if title has changed or slug is missing
+        if self.title:
+            new_slug = slugify(self.title)
+            if self.slug != new_slug:
+                self.slug = new_slug
         
-        if not self.code:
-            # Get all churches with code, sort descending, take first
-            existing = Church.objects.filter(code__isnull=False).values_list('code', flat=True).order_by('-code')
-            
-            if existing:
-                max_code = existing[0]
-                self.code = max_code + 1
-            else:
-                self.code = 1
+        if self._state.adding and not self.code:
+            existing = Church.objects.filter(code__isnull=False).order_by('-code').values_list('code', flat=True).first()
+            self.code = (existing + 1) if existing else 1
         
-        # Save with retry logic for conflicts
+        # Save with retry logic for IntegrityError (concurrency)
         max_attempts = 5
         for attempt in range(max_attempts):
             try:
                 with transaction.atomic():
                     super().save(*args, **kwargs)
-                return  # Success!
+                return 
             except IntegrityError:
                 if attempt == max_attempts - 1:
                     raise
-                # Retry with next code
-                if not self.code:
-                    existing = Church.objects.filter(code__isnull=False).values_list('code', flat=True).order_by('-code')
-                    self.code = (existing[0] + 1) if existing else 1
-                else:
-                    self.code = self.code + 1
+                existing = Church.objects.filter(code__isnull=False).order_by('-code').values_list('code', flat=True).first()
+                self.code = (existing + 1) if existing else 1
     def __str__(self):
         return self.title
 
@@ -177,6 +176,7 @@ class User(AbstractBaseUser, PermissionsMixin):
     name = models.CharField(max_length=100, blank=True)
     phone_number = models.CharField(max_length=50, unique=True, db_index=True)
     picture_url = models.URLField(blank=True, null=True)
+    notification_preferences = models.JSONField(default=dict, blank=True)
     ROLE_CHOICES = [
         ("SADMIN", "Sadmin"),
         ("USER", "User"),
@@ -231,7 +231,8 @@ class Content(models.Model):
         ("EVENT", "Event"),
         ("VIDEO", "Video"),
         ("POST", "Short"),
-        ("BOOK","Book")
+        ("BOOK", "Book"),
+        ("STORY", "Story")
     ]
 
     DELIVERY_CHOICES = [
@@ -521,10 +522,20 @@ class Subscription(models.Model):
         return self.plan
 
     def get_plan_price(self):
-        """Retourne le prix du plan"""
+        """Retourne le prix du plan (cherche dans SubscriptionPlan en priorité)"""
         if self.subscription_plan:
             return self.subscription_plan.price
-        # Prix hardcodés pour compatibilité
+            
+        # Fallback: chercher par le nom du plan (STARTER, PRO, etc.)
+        try:
+            # On utilise apps.get_model pour éviter les imports circulaires si nécessaire
+            plan_obj = apps.get_model("api", "SubscriptionPlan").objects.filter(name=self.plan, is_active=True).first()
+            if plan_obj:
+                return plan_obj.price
+        except Exception:
+            pass
+
+        # Prix hardcodés en dernier recours pour compatibilité historique
         PLAN_PRICES = {
             "STARTER": 10000.00,
             "PRO": 30000.00,
@@ -610,6 +621,17 @@ class ChurchCommission(models.Model):
 
     class Meta:
         unique_together = ("church", "commission", "user")
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        # Sync Church.owner if role is OWNER
+        if self.role == "OWNER":
+            church = self.church
+            if church.owner != self.user:
+                church.owner = self.user
+                # Use update_fields to avoid re-running Church.save() logic
+                from api.models import Church
+                Church.objects.filter(pk=church.pk).update(owner=self.user)
 
     def __str__(self):
         return f"{self.user.phone_number} → {self.commission.name} @ {self.church.title}"
@@ -913,13 +935,20 @@ class TicketType(models.Model):
         return f"{self.content.title} — {self.name} ({self.price})"
 
     def available(self):
-        """Return remaining tickets for this type (None means unlimited)."""
+        """Return remaining tickets for this type (None means unlimited), taking into account active reservations."""
         if self.quantity is None:
             return None
-        Ticket = apps.get_model("api", "Ticket")
-        reserved = TicketReservation.objects.filter(ticket_type=self, expires_at__gt=timezone.now()).aggregate(sum=Sum('quantity'))['sum'] or 0
+        
+        # Tickets already issued
         sold = Ticket.objects.filter(ticket_type=self).count()
-        return max(0, self.quantity - (reserved or 0) - sold)
+        
+        # Tickets currently reserved (not expired)
+        reserved = TicketReservation.objects.filter(
+            ticket_type=self, 
+            expires_at__gt=timezone.now()
+        ).aggregate(sum=Sum('quantity'))['sum'] or 0
+        
+        return max(0, self.quantity - sold - reserved)
 
 class TicketReservation(models.Model):
     """Temporary reservation to hold tickets during payment window."""
@@ -1011,6 +1040,9 @@ class ChatRoom(models.Model):
     church = models.ForeignKey("Church", on_delete=models.CASCADE, related_name="chat_rooms")
     room_type = models.CharField(max_length=20, choices=ROOM_TYPES, default='CHURCH')
     name = models.CharField(max_length=100)
+    description = models.TextField(blank=True)
+    avatar_url = models.URLField(max_length=500, blank=True, null=True)
+    only_admins_can_send = models.BooleanField(default=False)
     
     # Optional: for COMMISSION type
     commission = models.ForeignKey("Commission", on_delete=models.CASCADE, null=True, blank=True, related_name="chat_rooms")
@@ -1037,18 +1069,18 @@ class ChatRoom(models.Model):
     
     def user_has_access(self, user):
         """Check if a user has access to this room"""
-        from django.db.models import Q
-        
         if not user.is_authenticated:
             return False
-        
-        # Owners always have access to all rooms of their church
-        is_owner = User.objects.filter(
+
+        if getattr(user, "role", None) == "SADMIN":
+            return True
+
+        is_admin = User.objects.filter(
             id=user.id,
             church_roles__church=self.church,
-            church_roles__role='OWNER'
+            church_roles__role__in=["OWNER", "ADMIN"],
         ).exists()
-        if is_owner:
+        if is_admin:
             return True
         
         # Check based on room type
@@ -1073,14 +1105,43 @@ class ChatRoom(models.Model):
             if self.commission:
                 return User.objects.filter(
                     id=user.id,
-                    church_commissions__commission=self.commission
+                    church_commissions__church=self.church,
+                    church_commissions__commission=self.commission,
+                ).exists()
+            return False
+
+        elif self.room_type == 'PROGRAMME':
+            if self.programme:
+                return User.objects.filter(
+                    id=user.id,
+                    programmes__programme=self.programme,
                 ).exists()
             return False
         
         elif self.room_type == 'CUSTOM':
-            return self.members.filter(id=user.id).exists()
+            return self.created_by_id == user.id or self.members.filter(id=user.id).exists()
         
         return False
+
+    def user_can_send_message(self, user):
+        if not self.user_has_access(user):
+            return False
+
+        if not self.only_admins_can_send:
+            return True
+
+        if getattr(user, "role", None) == "SADMIN":
+            return True
+
+        is_admin = User.objects.filter(
+            id=user.id,
+            church_roles__church=self.church,
+            church_roles__role__in=["OWNER", "ADMIN"],
+        ).exists()
+        if is_admin:
+            return True
+
+        return self.room_type == "CUSTOM" and self.created_by_id == user.id
     
     def get_members_queryset(self):
         """Get all members who have access to this room based on type"""
@@ -1111,20 +1172,32 @@ class ChatRoom(models.Model):
             ).distinct()
         
         elif self.room_type == 'COMMISSION':
-            # All commission members + owners
+            # All commission members + church admins
             if self.commission:
                 return User.objects.filter(
-                    Q(church_commissions__commission=self.commission) |
-                    Q(church_roles__church=self.church, church_roles__role='OWNER')
+                    Q(
+                        church_commissions__church=self.church,
+                        church_commissions__commission=self.commission,
+                    ) |
+                    Q(church_roles__church=self.church, church_roles__role__in=['OWNER', 'ADMIN'])
+                ).distinct()
+            return owners_qs.distinct()
+
+        elif self.room_type == 'PROGRAMME':
+            if self.programme:
+                return User.objects.filter(
+                    Q(programmes__programme=self.programme) |
+                    Q(church_roles__church=self.church, church_roles__role__in=['OWNER', 'ADMIN'])
                 ).distinct()
             return owners_qs.distinct()
         
         elif self.room_type == 'CUSTOM':
-            # Custom members + owners
+            # Custom members + creator + church admins
             custom_members = self.members.values_list('id', flat=True)
             return User.objects.filter(
                 Q(id__in=custom_members) |
-                Q(church_roles__church=self.church, church_roles__role='OWNER')
+                Q(id=self.created_by_id) |
+                Q(church_roles__church=self.church, church_roles__role__in=['OWNER', 'ADMIN'])
             ).distinct()
         
         return owners_qs.distinct()
@@ -1135,12 +1208,20 @@ class ChatMessage(models.Model):
     room = models.ForeignKey("ChatRoom", on_delete=models.CASCADE, related_name="messages")
     user = models.ForeignKey("User", on_delete=models.CASCADE, related_name="chat_messages")
     message = models.TextField(blank=True)
+    reply_to = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="replies",
+    )
     
     # AWS URLs
     image_url = models.URLField(max_length=500, null=True, blank=True)
     audio_url = models.URLField(max_length=500, null=True, blank=True)
     
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    edited_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["created_at"]
@@ -1151,6 +1232,28 @@ class ChatMessage(models.Model):
 
     def __str__(self):
         return f"{self.user.name} - {self.room.name}"
+
+
+class ChatMessageRead(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    message = models.ForeignKey(
+        "ChatMessage",
+        on_delete=models.CASCADE,
+        related_name="reads",
+    )
+    user = models.ForeignKey(
+        "User",
+        on_delete=models.CASCADE,
+        related_name="chat_message_reads",
+    )
+    read_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("message", "user")
+        indexes = [
+            models.Index(fields=["message", "user"]),
+            models.Index(fields=["user", "read_at"]),
+        ]
 
 
 # =====================================================
@@ -2032,5 +2135,3 @@ class ServiceConfiguration(models.Model):
             errors = self.validate_freemopay_config()
 
         return len(errors) == 0
-
-

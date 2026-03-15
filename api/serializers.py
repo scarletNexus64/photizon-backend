@@ -1,33 +1,128 @@
 from rest_framework import serializers
-from api.models import BookOrder, Comment, Content, Donation, DonationCategory,Tag, ContentLike, ContentView, Playlist, PlaylistItem, User,Church, Subscription, SubscriptionPlan, ChurchAdmin,Commission,ChurchCommission,Category, TicketType, Ticket, TicketReservation, Receipt, ChatMessage, ChatRoom, Testimony, ChurchCollaboration, TestimonyLike, Programme, ProgrammeMember, ContentNotification, ProgrammeContentNotification
+from api.models import BookOrder, Comment, Content, Donation, DonationCategory,Tag, ContentLike, ContentView, Playlist, PlaylistItem, User,Church, Subscription, SubscriptionPlan, ChurchAdmin,Commission,ChurchCommission,Category, TicketType, Ticket, TicketReservation, Receipt, ChatMessage, ChatRoom, ChatMessageRead, Testimony, ChurchCollaboration, TestimonyLike, Programme, ProgrammeMember, ContentNotification, Notification, ProgrammeContentNotification
 from django.utils.text import slugify
+from api.services.notification_preferences import normalize_notification_preferences
+
+class StrictFieldsSerializerMixin:
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        incoming_keys = set(getattr(self, "initial_data", {}).keys())
+        allowed_keys = set(self.fields.keys())
+        unknown_keys = incoming_keys - allowed_keys
+        if unknown_keys:
+            raise serializers.ValidationError(
+                {
+                    key: "This field is not allowed."
+                    for key in sorted(unknown_keys)
+                }
+            )
+        return attrs
+
 
 class UserSerializer(serializers.ModelSerializer):
+    current_church = serializers.PrimaryKeyRelatedField(read_only=True)
+    notification_preferences = serializers.SerializerMethodField()
+
     class Meta:
         model = User
-        fields = "__all__"
+        fields = [
+            "id",
+            "name",
+            "phone_number",
+            "picture_url",
+            "role",
+            "email",
+            "city",
+            "country",
+            "address",
+            "longitude",
+            "latitude",
+            "current_church",
+            "notification_preferences",
+            "is_active",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields
+
+    def get_notification_preferences(self, obj):
+        return normalize_notification_preferences(obj.notification_preferences)
+
+
+class UserSelfUpdateSerializer(StrictFieldsSerializerMixin, serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = [
+            "name",
+            "picture_url",
+            "email",
+            "city",
+            "country",
+            "address",
+            "longitude",
+            "latitude",
+        ]
+
+
+class NotificationPreferencesSerializer(
+    StrictFieldsSerializerMixin,
+    serializers.Serializer,
+):
+    general = serializers.BooleanField(required=False)
+    content = serializers.BooleanField(required=False)
+    social = serializers.BooleanField(required=False)
+    chat = serializers.BooleanField(required=False)
+    donation = serializers.BooleanField(required=False)
+
+    def to_representation(self, instance):
+        return normalize_notification_preferences(instance)
 
 class ChurchSerializer(serializers.ModelSerializer):
     sub_churches = serializers.SerializerMethodField()
     phone_number = serializers.CharField(read_only=True)
-    phone_number_1 = serializers.CharField(read_only=True)
-    phone_number_2 = serializers.CharField(read_only=True)
-    phone_number_3 = serializers.CharField(read_only=True)
-    phone_number_4 = serializers.CharField(read_only=True)
+    
     class Meta:
         model = Church
         fields = "__all__"
         read_only_fields = ["status", "code", "slug", "is_verified", "created_at"]
 
     def get_sub_churches(self, obj):
-        qs = obj.sub_churches.all()
-        return [{"id": c.id, "title": c.title, "slug": c.slug, "status": c.status,"code":c.code,"logo_url":c.logo_url,
-                 "phone_number":c.phone_number,
-                 "phone_number_1": c.phone_number_1,
-                 "phone_number_2": c.phone_number_2,
-                 "phone_number_3": c.phone_number_3,
-                 "phone_number_4": c.phone_number_4,
-                 "is_verified":c.is_verified} for c in qs]
+        # Utiliser values() pour une requête groupée efficace si possible, 
+        # ou limiter les champs retournés
+        return obj.sub_churches.all().values(
+            "id", "title", "slug", "status", "code", "logo_url", "is_verified"
+        )
+
+
+class ChurchUpdateSerializer(StrictFieldsSerializerMixin, serializers.ModelSerializer):
+    class Meta:
+        model = Church
+        fields = [
+            "title",
+            "description",
+            "logo_url",
+            "primary_color",
+            "secondary_color",
+            "email",
+            "phone_number_1",
+            "phone_number_2",
+            "phone_number_3",
+            "phone_number_4",
+            "website",
+            "whatsapp_phone",
+            "doc_url",
+            "tiktok_url",
+            "instagram_url",
+            "youtube_url",
+            "facebook_url",
+            "city",
+            "country",
+            "longitude",
+            "latitude",
+            "seats",
+            "is_public",
+            "lang",
+        ]
 
 
 
@@ -36,9 +131,11 @@ class ChurchCreateSerializer(serializers.ModelSerializer):
         model = Church
         fields = [
             "title", "logo_url",
+            "description",
             "primary_color", "secondary_color",
             "phone_number_1", "phone_number_2", "phone_number_3", "phone_number_4",
             "city", "country","lang",
+            "longitude", "latitude",
             "seats", "is_public"
         ]
 
@@ -47,9 +144,11 @@ class SubChurchCreateSerializer(serializers.ModelSerializer):
         model = Church
         fields = [
             "title", "logo_url", "parent",
+            "description",
             "primary_color", "secondary_color",
             "phone_number_1", "phone_number_2", "phone_number_3", "phone_number_4",
             "city", "country", "lang",
+            "longitude", "latitude",
             "seats", "is_public",
         ]
         
@@ -89,6 +188,7 @@ class ChurchMiniSerializer(serializers.ModelSerializer):
 class UserMeSerializer(serializers.ModelSerializer):
     current_church = ChurchMiniSerializer(read_only=True)
     church_roles = ChurchRoleSerializer(many=True, read_only=True)
+    notification_preferences = serializers.SerializerMethodField()
 
     is_sadmin = serializers.SerializerMethodField()
 
@@ -98,17 +198,27 @@ class UserMeSerializer(serializers.ModelSerializer):
             "id",
             "name",
             "phone_number",
+            "email",
+            "city",
+            "country",
+            "address",
+            "longitude",
+            "latitude",
             "picture_url",
             "role",
             "is_sadmin",
             "current_church",
             "church_roles",
+            "notification_preferences",
             "created_at",
             "updated_at",
         ]
 
     def get_is_sadmin(self, obj):
         return obj.role == "SADMIN"
+
+    def get_notification_preferences(self, obj):
+        return normalize_notification_preferences(obj.notification_preferences)
 
 class MemberSerializer(serializers.ModelSerializer):
     class Meta:
@@ -225,18 +335,63 @@ class TagSerializer(serializers.ModelSerializer):
 class ContentListSerializer(serializers.ModelSerializer):
     category = CategorySerializer(read_only=True)
     tags = serializers.SerializerMethodField()
-    church = serializers.PrimaryKeyRelatedField(read_only=True)
+    church = serializers.SerializerMethodField()
+    created_by = serializers.SerializerMethodField()
+    likes_count = serializers.SerializerMethodField()
+    comments_count = serializers.SerializerMethodField()
+    views_count = serializers.SerializerMethodField()
+    is_liked = serializers.SerializerMethodField()
 
     class Meta:
         model = Content
         fields = [
             "id","church","type","title","slug","description","cover_image_url",
+            "audio_url","video_url","file",
             "is_paid","price","currency","category","tags","created_at","published",
-            "capacity","tickets_sold","allow_ticket_sales"
+            "capacity","tickets_sold","allow_ticket_sales","created_by",
+            "likes_count","comments_count","views_count","is_liked","start_at",
+            "planned_release_date","location"
         ]
 
     def get_tags(self, obj):
-        return list(obj.contenttag_set.select_related("tag").values("tag__id","tag__name","tag__slug"))
+        # On suppose que contenttag_set__tag est pré-chargé via prefetch_related
+        # Si c'est le cas, on itère en mémoire au lieu de refaire une requête DB
+        if hasattr(obj, 'contenttag_set'):
+            return [
+                {"tag__id": ct.tag.id, "tag__name": ct.tag.name, "tag__slug": ct.tag.slug}
+                for ct in obj.contenttag_set.all()
+            ]
+        return []
+
+    def get_church(self, obj):
+        return {
+            "id": obj.church.id,
+            "title": obj.church.title,
+            "code": obj.church.code,
+            "logo_url": obj.church.logo_url,
+        }
+
+    def get_created_by(self, obj):
+        if not obj.created_by:
+            return None
+        return {
+            "id": obj.created_by.id,
+            "name": obj.created_by.name,
+            "picture_url": obj.created_by.picture_url,
+            "phone_number": obj.created_by.phone_number,
+        }
+
+    def get_likes_count(self, obj):
+        return int(getattr(obj, "likes_count", 0) or 0)
+
+    def get_comments_count(self, obj):
+        return int(getattr(obj, "comments_count", 0) or 0)
+
+    def get_views_count(self, obj):
+        return int(getattr(obj, "views_count", 0) or 0)
+
+    def get_is_liked(self, obj):
+        return bool(getattr(obj, "is_liked", False))
 
 class ContentDetailSerializer(serializers.ModelSerializer):
     category = CategorySerializer(read_only=True)
@@ -249,7 +404,10 @@ class ContentDetailSerializer(serializers.ModelSerializer):
         fields = "__all__"
 
     def get_tags(self, obj):
-        return TagSerializer([ct.tag for ct in obj.contenttag_set.all()], many=True).data
+        # Utiliser les données préchargées en mémoire si possible
+        if hasattr(obj, 'contenttag_set'):
+             return [{"id": ct.tag.id, "name": ct.tag.name, "slug": ct.tag.slug} for ct in obj.contenttag_set.all()]
+        return []
 
     def get_church(self, obj):
         return {"id": obj.church.id, "title": obj.church.title, "code": obj.church.code}
@@ -408,7 +566,7 @@ class DonationSerializer(serializers.ModelSerializer):
         fields = [
             "id", "user", "church", "category",
             "amount", "currency", "gateway", "gateway_transaction_id",
-             "message", "metadata","withdrawed"
+             "message", "metadata","withdrawed", "created_at"
             
         ]
 
@@ -517,11 +675,40 @@ class ReceiptSerializer(serializers.ModelSerializer):
 class ChatMessageSerializer(serializers.ModelSerializer):
     user_name = serializers.CharField(source="user.name", read_only=True)
     user_id = serializers.CharField(source="user.id", read_only=True)
+    reply_to_preview = serializers.SerializerMethodField()
+    is_read = serializers.SerializerMethodField()
+    read_count = serializers.SerializerMethodField()
 
     class Meta:
         model = ChatMessage
-        fields = ["id", "user", "user_name", "user_id", "message", "image_url", "audio_url", "created_at"]
+        fields = [
+            "id", "user", "user_name", "user_id", "message",
+            "reply_to", "reply_to_preview",
+            "image_url", "audio_url", "created_at", "edited_at",
+            "is_read", "read_count",
+        ]
         read_only_fields = ["id", "created_at", "user"]
+
+    def get_reply_to_preview(self, obj):
+        parent = obj.reply_to
+        if parent is None:
+            return None
+        return {
+            "id": parent.id,
+            "user_name": parent.user.name,
+            "message": parent.message,
+            "image_url": parent.image_url,
+            "audio_url": parent.audio_url,
+        }
+
+    def get_is_read(self, obj):
+        request = self.context.get("request")
+        if request is None or not getattr(request, "user", None):
+            return False
+        return obj.reads.filter(user=request.user).exists()
+
+    def get_read_count(self, obj):
+        return obj.reads.count()
 
 
 class ChatRoomSerializer(serializers.ModelSerializer):
@@ -537,7 +724,8 @@ class ChatRoomSerializer(serializers.ModelSerializer):
         model = ChatRoom
         fields = [
             "id", "church", "church_title", "room_type", "room_type_display", 
-            "name", "commission", "commission_name", "members_count", "members_list",
+            "name", "description", "avatar_url", "only_admins_can_send",
+            "commission", "commission_name", "members_count", "members_list",
             "created_at", "updated_at", "created_by", "created_by_name", "messages"
         ]
         read_only_fields = ["id", "created_at", "updated_at", "created_by"]
@@ -561,13 +749,46 @@ class ChatRoomSerializer(serializers.ModelSerializer):
         ]
 
 
+class ChatRoomListSerializer(serializers.ModelSerializer):
+    """
+    Lightweight serializer for rooms list to avoid returning the full messages
+    payload for every room.
+    """
+    church_title = serializers.CharField(source="church.title", read_only=True)
+    room_type_display = serializers.CharField(source="get_room_type_display", read_only=True)
+    created_by_name = serializers.CharField(source="created_by.name", read_only=True)
+    commission_name = serializers.CharField(source="commission.name", read_only=True, allow_null=True)
+    members_count = serializers.SerializerMethodField()
+    last_message = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ChatRoom
+        fields = [
+            "id", "church", "church_title", "room_type", "room_type_display",
+            "name", "description", "avatar_url", "only_admins_can_send",
+            "commission", "commission_name", "members_count",
+            "created_at", "updated_at", "created_by", "created_by_name",
+            "last_message",
+        ]
+
+    def get_members_count(self, obj):
+        return obj.get_members_queryset().count()
+
+    def get_last_message(self, obj):
+        annotated = getattr(obj, "last_message", None)
+        if annotated is not None:
+            return annotated
+        return obj.messages.order_by("-created_at").values_list("message", flat=True).first()
+
+
 class ChatRoomCreateUpdateSerializer(serializers.ModelSerializer):
     """Serializer for creating/updating chat rooms"""
     
     class Meta:
         model = ChatRoom
         fields = [
-            "church", "room_type", "name", "commission", "members"
+            "church", "room_type", "name", "description", "avatar_url",
+            "only_admins_can_send", "commission", "members"
         ]
     
     def validate(self, data):
@@ -592,17 +813,28 @@ class TestimonySerializer(serializers.ModelSerializer):
     user_name = serializers.CharField(source='user.name', read_only=True)
     church_title = serializers.CharField(source='church.title', read_only=True)
     approved_by_name = serializers.CharField(source='approved_by.name', read_only=True, allow_null=True)
+    likes_count = serializers.SerializerMethodField()
+    user_liked = serializers.SerializerMethodField()
     
     class Meta:
         model = Testimony
         fields = [
             "id", "church", "church_title", "user", "user_name",
             "type", "title", "text_content", "audio_url", "duration",
-            "status", "is_public", "views_count",
+            "status", "is_public", "views_count", "likes_count", "user_liked",
             "created_at", "updated_at", "approved_at", "approved_by", "approved_by_name",
             "rejection_reason"
         ]
         read_only_fields = ["id", "created_at", "updated_at", "views_count"]
+
+    def get_likes_count(self, obj):
+        return obj.likes.count()
+
+    def get_user_liked(self, obj):
+        request = self.context.get("request")
+        if request and request.user.is_authenticated:
+            return obj.likes.filter(user=request.user).exists()
+        return False
 
 
 class TestimonyCreateSerializer(serializers.ModelSerializer):
@@ -661,15 +893,26 @@ class TestimonyListSerializer(serializers.ModelSerializer):
     """Simplified serializer for listing testimonies"""
     user_name = serializers.CharField(source='user.name', read_only=True)
     user_picture = serializers.CharField(source='user.picture_url', read_only=True)
+    likes_count = serializers.SerializerMethodField()
+    user_liked = serializers.SerializerMethodField()
     
     class Meta:
         model = Testimony
         fields = [
             "id", "user", "user_name", "user_picture",
             "type", "title", "text_content", "audio_url", "duration",
-            "status", "views_count", "created_at"
+            "status", "views_count", "likes_count", "user_liked", "created_at"
         ]
         read_only_fields = fields
+
+    def get_likes_count(self, obj):
+        return obj.likes.count()
+
+    def get_user_liked(self, obj):
+        request = self.context.get("request")
+        if request and request.user.is_authenticated:
+            return obj.likes.filter(user=request.user).exists()
+        return False
 
 
 class TestimonyApprovalSerializer(serializers.ModelSerializer):
@@ -1003,6 +1246,26 @@ class ContentComingSoonSerializer(serializers.ModelSerializer):
     
     def get_subscriber_count(self, obj):
         return obj.notifications.filter(is_notified=False).count()
+
+
+class NotificationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Notification
+        fields = [
+            "id",
+            "title",
+            "message",
+            "eng_title",
+            "eng_message",
+            "type",
+            "channel",
+            "is_read",
+            "sent",
+            "created_at",
+            "sent_at",
+            "meta",
+        ]
+        read_only_fields = fields
 
 
 # =====================================================

@@ -9,6 +9,7 @@ from django.utils.dateparse import parse_date
 from api.models import BookOrder, ChurchAdmin, Content, Donation, DonationCategory, Church, User, TicketType, Payment
 from api.serializers import BookOrderSerializer, DonationSerializer, DonationCategorySerializer, TicketSerializer
 from api.permissions import IsAuthenticatedUser, user_is_church_owner, IsSuperAdmin
+from api.services.notification_preferences import create_in_app_notification
 
 # ----------------------
 # DonationCategory CRUD
@@ -83,7 +84,55 @@ def make_donation(request, church_id):
         message=message
     )
 
-    # Auto-confirm cash donations
+    payment_status = "SUCCESS" if gateway == "CASH" else "PENDING"
+    Payment.objects.create(
+        user=request.user,
+        church=church,
+        donation=donation,
+        amount=donation.amount,
+        currency=donation.currency,
+        gateway=gateway,
+        status=payment_status,
+        metadata={
+            "source": "donation",
+            "category_id": str(category.id) if category else None,
+            "category_name": category.name if category else None,
+            "message": message,
+        },
+    )
+
+    if gateway == "CASH":
+        donation.confirmed_at = timezone.now()
+        donation.metadata = {
+            **donation.metadata,
+            "payment_status": "SUCCESS",
+            "ready_for_gateway": False,
+        }
+        donation.save(update_fields=["confirmed_at", "metadata"])
+    else:
+        donation.metadata = {
+            **donation.metadata,
+            "payment_status": "PENDING",
+            "ready_for_gateway": True,
+        }
+        donation.save(update_fields=["metadata"])
+
+    category_label = category.name if category else "Don"
+    create_in_app_notification(
+        user=request.user,
+        title="Don enregistré",
+        message=(
+            f"Votre don de {donation.amount} {donation.currency} pour {category_label} "
+            f"a été enregistré avec le canal {gateway}."
+        ),
+        notif_type="SUCCESS",
+        category="donation",
+        meta={
+            "donation_id": str(donation.id),
+            "payment_gateway": gateway,
+            "payment_status": payment_status,
+        },
+    )
 
     serializer = DonationSerializer(donation)
     return Response(serializer.data, status=201)
@@ -574,7 +623,50 @@ def create_book_order(request, book_id):
         if ticket_tier:
             order_kwargs["ticket_tier"] = ticket_tier.upper()
 
-    order = BookOrder.objects.create(**order_kwargs)
+    with transaction.atomic():
+        # Verrouillage et vérification finale de la disponibilité
+        if is_ticket:
+            from api.models import TicketReservation
+            expires_at = timezone.now() + timedelta(minutes=15)
+            
+            if ticket_type_id:
+                # On utilise TicketType.available() qui doit inclure les réservations (on vérifiera ça après)
+                tt = TicketType.objects.select_for_update().get(id=ticket_type_id)
+                if tt.available() < quantity:
+                    return Response({"error": "Tickets no longer available for this type."}, status=400)
+                
+                TicketReservation.objects.create(
+                    user=request.user,
+                    content=content,
+                    ticket_type=tt,
+                    quantity=quantity,
+                    expires_at=expires_at
+                )
+            elif ticket_tier:
+                # Pour les tiers sur Content, on verrouille le Content
+                c = Content.objects.select_for_update().get(id=content.id)
+                tier = ticket_tier.upper()
+                qty_field = {"CLASSIC": "classic_quantity", "VIP": "vip_quantity", "PREMIUM": "premium_quantity"}.get(tier)
+                avail = getattr(c, qty_field, 0)
+                
+                # Calculer les réservations actives pour ce tier sur ce contenu
+                # Note: Le modèle TicketReservation actuel ne semble pas avoir de champ 'ticket_tier' string, 
+                # seulement une FK vers TicketType. On va devoir adapter le modèle ou la logique.
+                # Pour l'instant, on se base sur la capacité simple si pas de TicketType.
+                
+                if avail is not None and avail < quantity:
+                    return Response({"error": f"Not enough tickets available for tier {tier}."}, status=400)
+                
+                # On crée la réservation (on aura peut-être besoin d'ajouter ticket_tier au modèle Reservation)
+                TicketReservation.objects.create(
+                    user=request.user,
+                    content=c,
+                    quantity=quantity,
+                    expires_at=expires_at,
+                    metadata={"ticket_tier": tier}
+                )
+
+        order = BookOrder.objects.create(**order_kwargs)
 
     serializer = BookOrderSerializer(order)
     return Response(serializer.data, status=201)

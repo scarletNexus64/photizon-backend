@@ -4,7 +4,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from django.utils import timezone
 from django.db.models import Q, Sum
-from api.models import Testimony, Church, User, TestimonyLike
+from api.models import Testimony, Church, User, TestimonyLike, Notification
 from api.serializers import (
     TestimonySerializer,
     TestimonyCreateSerializer,
@@ -14,6 +14,54 @@ from api.serializers import (
     TestimonyLikeSerializer
 )
 from api.permissions import IsTestimonyOwner
+from api.services.notification_preferences import create_in_app_notification
+
+
+def _build_testimony_notification_meta(testimony, *, action, actor=None, extra=None):
+    meta = {
+        "testimony_id": str(testimony.id),
+        "testimony_title": testimony.title,
+        "church_id": str(testimony.church_id),
+        "interaction_type": action,
+        "target_type": "TESTIMONY",
+    }
+    if actor is not None:
+        meta["actor_id"] = str(actor.id)
+        meta["actor_name"] = actor.name
+    if extra:
+        meta.update(extra)
+    return meta
+
+
+def _notify_testimony_owner(
+    testimony,
+    *,
+    title,
+    message,
+    action,
+    actor=None,
+    allow_self=False,
+    extra=None,
+):
+    owner = testimony.user
+    if owner is None:
+        return
+    if actor is not None and owner.id == actor.id and not allow_self:
+        return
+
+    create_in_app_notification(
+        user=owner,
+        title=title,
+        message=message,
+        notif_type="INFO",
+        category="social",
+        meta=_build_testimony_notification_meta(
+            testimony,
+            action=action,
+            actor=actor,
+            extra=extra,
+        ),
+    )
 
 
 # =====================================================
@@ -188,7 +236,7 @@ def retrieve_testimony(request, church_id, testimony_id):
                 status=status.HTTP_403_FORBIDDEN
             )
     
-    serializer = TestimonySerializer(testimony)
+    serializer = TestimonySerializer(testimony, context={"request": request})
     return Response(serializer.data)
 
 
@@ -233,7 +281,11 @@ def list_church_testimonies(request, church_id):
     total_count = qs.count()
     testimonies = qs[offset:offset + limit]
     
-    serializer = TestimonyListSerializer(testimonies, many=True)
+    serializer = TestimonyListSerializer(
+        testimonies,
+        many=True,
+        context={"request": request},
+    )
     
     return Response({
         "count": total_count,
@@ -294,7 +346,7 @@ def list_user_testimonies(request, user_id):
     # Get user's testimonies
     qs = Testimony.objects.filter(user=user)
     
-    serializer = TestimonyListSerializer(qs, many=True)
+    serializer = TestimonyListSerializer(qs, many=True, context={"request": request})
     
     return Response({
         "count": qs.count(),
@@ -324,7 +376,7 @@ def my_testimonies(request):
     if type_filter:
         qs = qs.filter(type=type_filter)
     
-    serializer = TestimonyListSerializer(qs, many=True)
+    serializer = TestimonyListSerializer(qs, many=True, context={"request": request})
     
     return Response({
         "count": qs.count(),
@@ -369,8 +421,17 @@ def approve_testimony(request, church_id, testimony_id):
     
     # Approve the testimony
     testimony.approve(request.user)
-    
-    serializer = TestimonySerializer(testimony)
+
+    _notify_testimony_owner(
+        testimony,
+        title=f"Temoignage approuve: {testimony.title}",
+        message="Votre temoignage a ete approuve et est maintenant visible.",
+        action="TESTIMONY_APPROVED",
+        actor=request.user,
+        allow_self=True,
+    )
+
+    serializer = TestimonySerializer(testimony, context={"request": request})
     return Response(serializer.data)
 
 
@@ -415,8 +476,18 @@ def reject_testimony(request, church_id, testimony_id):
     
     # Reject the testimony
     testimony.reject(reason)
-    
-    serializer = TestimonySerializer(testimony)
+
+    _notify_testimony_owner(
+        testimony,
+        title=f"Temoignage refuse: {testimony.title}",
+        message=f"Votre temoignage a ete refuse. Motif: {reason}",
+        action="TESTIMONY_REJECTED",
+        actor=request.user,
+        allow_self=True,
+        extra={"rejection_reason": reason},
+    )
+
+    serializer = TestimonySerializer(testimony, context={"request": request})
     return Response(serializer.data)
 
 
@@ -449,7 +520,7 @@ def list_pending_testimonies(request, church_id):
     # Get pending testimonies
     qs = Testimony.objects.filter(church=church, status="PENDING").order_by('-created_at')
     
-    serializer = TestimonyListSerializer(qs, many=True)
+    serializer = TestimonyListSerializer(qs, many=True, context={"request": request})
     
     return Response({
         "count": qs.count(),
@@ -589,6 +660,13 @@ def toggle_like_testimony(request, church_id, testimony_id):
         })
     else:
         # Like was created
+        _notify_testimony_owner(
+            testimony,
+            title=f"Nouveau like sur {testimony.title}",
+            message=f"{request.user.name} a aime votre temoignage.",
+            action="LIKE",
+            actor=request.user,
+        )
         return Response({
             "liked": True,
             "likes_count": testimony.likes.count()
@@ -632,5 +710,3 @@ def get_testimony_likes(request, church_id, testimony_id):
         "user_liked": user_liked,
         "results": serializer.data
     })
-
-

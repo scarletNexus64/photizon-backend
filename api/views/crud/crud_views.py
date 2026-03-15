@@ -3,7 +3,7 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 from django.utils import timezone
 from api.models import Church,ChurchAdmin, ChurchCommission, Deny,Subscription,User
-from api.serializers import ChurchAdminSerializer, OwnerSerializer,SubChurchCreateSerializer,ChurchCreateSerializer, MemberSerializer,SubscriptionSerializer,ChurchSerializer, UserMeSerializer, UserSerializer
+from api.serializers import ChurchAdminSerializer, OwnerSerializer,SubChurchCreateSerializer,ChurchCreateSerializer, MemberSerializer,SubscriptionSerializer,ChurchSerializer, ChurchUpdateSerializer, UserMeSerializer, UserSelfUpdateSerializer, UserSerializer
 from api.permissions import IsAuthenticatedUser, IsSuperAdmin, user_is_church_admin, user_is_church_owner
 from rest_framework import status
 from django.db.models import Count
@@ -11,6 +11,7 @@ from django.db.models import Q
 from api.services.notify import create_and_send_whatsapp_notification
 from django.utils.text import slugify
 from django.db import transaction
+from django.core.files.storage import default_storage
 
 from api.utils import can_join_church
 
@@ -99,6 +100,23 @@ def list_my_churches(request):
     serializer = ChurchSerializer(qs, many=True)
     return Response(serializer.data)
 
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticatedUser])
+def retrieve_church(request, church_id):
+    church = get_object_or_404(Church, id=church_id)
+
+    has_access = (
+        request.user.role == "SADMIN"
+        or request.user.current_church_id == church.id
+        or ChurchAdmin.objects.filter(user=request.user, church=church).exists()
+        or church.is_public
+    )
+    if not has_access:
+        return Response({"detail": "Forbidden"}, status=403)
+
+    return Response(ChurchSerializer(church).data)
+
 @api_view(["POST"])
 @permission_classes([IsSuperAdmin])
 def verify_church_view(request, church_id):
@@ -180,18 +198,10 @@ def update_church(request, church_id):
     if not getattr(church, "is_verified", False):
         return Response({"detail": "Church not verified"}, status=403)
 
-    serializer = ChurchSerializer(church, data=request.data, partial=True)
+    serializer = ChurchUpdateSerializer(church, data=request.data, partial=True)
 
     if serializer.is_valid():
         updated = serializer.save()
-
-        # 🔥 Mettre à jour le slug si le titre change
-        if "title" in request.data:
-            updated.slug = slugify(updated.title)
-            updated.save()
-
-        # phone_number_1..4 are handled by the serializer automatically
-
         return Response(ChurchSerializer(updated).data)
 
     return Response(serializer.errors, status=400)
@@ -202,10 +212,20 @@ def update_church(request, church_id):
 @permission_classes([IsAuthenticatedUser])
 def update_self(request):
     user = request.user
-    serializer = UserSerializer(user, data=request.data, partial=True)
+    data = request.data.copy()
+
+    if "picture" in request.FILES:
+        uploaded_file = request.FILES["picture"]
+        file_name = default_storage.save(
+            f"profiles/{user.id}_{uploaded_file.name}",
+            uploaded_file,
+        )
+        data["picture_url"] = request.build_absolute_uri(default_storage.url(file_name))
+
+    serializer = UserSelfUpdateSerializer(user, data=data, partial=True)
     if serializer.is_valid():
         serializer.save()
-        return Response(serializer.data)
+        return Response(UserSerializer(user).data)
     return Response(serializer.errors, status=400)
 
 @api_view(["DELETE"])
@@ -266,16 +286,10 @@ def update_church_by_owner(request, church_id):
             status=403
         )
 
-    serializer = ChurchSerializer(church, data=request.data, partial=True)
+    serializer = ChurchUpdateSerializer(church, data=request.data, partial=True)
 
     if serializer.is_valid():
         updated_church = serializer.save()
-
-        # 🔥 Mettre à jour le slug si le titre change
-        if "title" in request.data:
-            updated_church.slug = slugify(updated_church.title)
-            updated_church.save()
-
         return Response(ChurchSerializer(updated_church).data)
 
     return Response(serializer.errors, status=400)
@@ -290,7 +304,7 @@ def me(request):
 @permission_classes([IsAuthenticatedUser])
 def churches_metrics(request):
     user = request.user
-    if not user.role != "SADMIN":
+    if user.role != "SADMIN":
         return Response({"detail": "Unauthorized"}, status=403)
 
     total_churches = Church.objects.count()
@@ -326,6 +340,14 @@ def churches_metrics(request):
             "top_churches": list(top_churches),
         }
     })
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticatedUser])
+def get_user_by_id(request, user_id):
+    """Récupère les informations publiques d'un utilisateur par son ID"""
+    user_obj = get_object_or_404(User, id=user_id)
+    # On utilise UserMeSerializer pour avoir les rôles et l'église actuelle
+    return Response(UserMeSerializer(user_obj).data)
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticatedUser])
@@ -525,7 +547,6 @@ def leave_commission(request, church_id, commission_id):
     user = request.user
 
     # Vérifier si l'utilisateur appartient à la bonne église
-    print(church_id)
     if str(user.current_church_id) != str(church_id):
         return Response({"detail": "Vous n'appartenez pas à cette église."}, status=400)
 

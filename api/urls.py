@@ -1,6 +1,7 @@
 from django.urls import path
 from api.views.commissions.commissions_view import add_member_to_commission, church_commissions_summary, create_commission, delete_commission, list_church_commission_members, list_church_commissions, list_church_commissions_with_members, list_commissions, remove_member_from_commission, update_commission, update_member_role_in_commission
-from api.views.contents.contents_view import add_comment, add_to_playlist, content_stats_for_church, content_stats_global, create_category, create_content, create_playlist, create_tag, delete_category, delete_comment, delete_content, delete_tag, feed_for_church, get_category, get_playlist_with_items,list_all_playlists, list_categories, list_comments, list_content, list_tags, recommend_for_user, reorder_playlist_item, retrieve_content, toggle_like_content, trending_content, update_category, update_content, update_tag, view_content, church_feed, list_coming_soon, subscribe_to_content, unsubscribe_from_content, get_my_subscriptions, get_content_subscribers
+from api.views.commissions.commissions_view import join_commission
+from api.views.contents.contents_view import add_comment, report_content, add_to_playlist, content_stats_for_church, content_stats_global, create_category, create_content, create_playlist, create_tag, delete_category, delete_comment, delete_content, delete_tag, feed_for_church, get_category, get_playlist_with_items,list_all_playlists, list_categories, list_comments, list_content, list_tags, recommend_for_user, reorder_playlist_item, retrieve_content, toggle_like_content, trending_content, update_category, update_content, update_tag, view_content, church_feed, list_coming_soon, subscribe_to_content, unsubscribe_from_content, get_my_subscriptions, get_content_subscribers
 from api.views.contents.contents_view import list_ticket_types, create_ticket_type, update_ticket_type, delete_ticket_type
 from api.views.programmes.programmes_view import (
     create_programme, retrieve_programme, update_programme, delete_programme,
@@ -9,11 +10,11 @@ from api.views.programmes.programmes_view import (
     get_programme_members, get_programme_content_notifications, mark_programme_notification_as_read
 )
 from .views.auth.auth_views import change_subscription_plan, check_subscription_status, delete_subscription, get_church_subscription, get_subscription_plan, list_subscription_plans, list_subscriptions, renew_subscription, send_otp_view, toggle_subscription_status, update_subscription, verify_otp_view
-from .views.crud.crud_views import churches_metrics,create_subchurch_view, deny_user,filter_church_members,get_current_user, join_church, leave_church, leave_commission, unban_user,update_church_by_owner,list_owners,list_users,delete_church,update_church,delete_self,update_self,delete_self,list_churches,create_church_view,list_my_churches,verify_church_view,add_church_admin,list_sub_churches
+from .views.crud.crud_views import churches_metrics,create_subchurch_view, deny_user,filter_church_members,get_current_user, get_user_by_id, join_church, leave_church, leave_commission, unban_user,update_church_by_owner,list_owners,list_users,delete_church,update_church,delete_self,update_self,delete_self,list_churches,create_church_view,list_my_churches,verify_church_view,add_church_admin,list_sub_churches,retrieve_church
 from .views.crud.receipt_views import ReceiptViewSet, create_receipt, get_receipt, update_receipt, delete_receipt, list_all_receipts
 from .views.chat.chat_views import (
     list_create_chat_rooms, room_detail, list_create_messages, message_detail,
-    add_member_to_custom_room, remove_member_from_custom_room,
+    add_member_to_custom_room, remove_member_from_custom_room, mark_room_messages_read,
     create_programme_chat, get_programme_chat, send_programme_message, get_programme_messages
 )
 from .views.testimonies.testimonies_view import (
@@ -34,7 +35,12 @@ from .views.gifts.gifts_view import (
     make_donation, list_user_donations, list_church_donations,
     church_donation_stats, admin_all_churches_donation_stats, user_book_orders, withdraw_all_donations_view, withdraw_all_orders_view, complete_book_order, church_payment_stats, admin_all_churches_payment_stats, admin_payments_summary
 )
+from .views.notifications.notifications_view import (
+    list_notifications, mark_all_notifications_as_read, mark_notification_as_read,
+    notification_preferences
+)
 from rest_framework.routers import DefaultRouter
+from rest_framework_simplejwt.views import TokenRefreshView
 
 # Router for Receipt ViewSet
 router = DefaultRouter()
@@ -42,9 +48,11 @@ router.register(r'receipts', ReceiptViewSet, basename='receipt')
 urlpatterns = [
     path("auth/send-otp/", send_otp_view),
     path("auth/verify-otp/", verify_otp_view),
+    path("auth/refresh/", TokenRefreshView.as_view(), name="token-refresh"),
     path("church/create/", create_church_view),
     path("subchurch/create/<str:church_id>/", create_subchurch_view),
     path("church/my/", list_my_churches),
+    path("church/<str:church_id>/", retrieve_church),
     path("church/verify/<str:church_id>/", verify_church_view),
     path("church/<str:church_id>/admins/add/", add_church_admin),
     path("church/<str:church_id>/sub_churches/", list_sub_churches),
@@ -71,6 +79,7 @@ urlpatterns = [
     path("sadmin/churches/", list_churches),
     path("sadmin/churches/metrics/", churches_metrics),
     path("user/me/",get_current_user ),
+    path("user/<str:user_id>/", get_user_by_id, name="get_user_by_id"),
     path("commissions/", list_commissions, name="list_commissions"),
     path("commissions/create/", create_commission, name="create_commission"),
     path("commissions/<str:commission_id>/update/",update_commission, name="update_commission"),
@@ -79,6 +88,7 @@ urlpatterns = [
     path("church/<str:church_id>/commissions/summary/",church_commissions_summary, name="church_commissions_summary"),
     path("church/<str:church_id>/commissions/<str:commission_id>/members/",list_church_commission_members, name="list_commission_members"),
     path("church/<str:church_id>/commissions/<str:commission_id>/members/add/",add_member_to_commission, name="add_member_to_commission"),
+    path("church/<str:church_id>/commissions/<str:commission_id>/join/", join_commission, name="join_commission"),
     path("church/<str:church_id>/commissions/<str:commission_id>/members/<str:user_id>/remove/",remove_member_from_commission, name="remove_member_from_commission"),
     path(
     "church/<str:church_id>/commissions/<str:commission_id>/members/<str:user_id>/role/",
@@ -110,7 +120,8 @@ urlpatterns = [
     path("contents/<str:content_id>/view/", view_content),
     path("contents/<str:content_id>/comments/", list_comments),
     path("contents/<str:content_id>/comments/add/", add_comment),
-    path("comments/<int:comment_id>/delete/", delete_comment),
+    path("contents/<str:content_id>/report/", report_content),
+    path("comments/<str:comment_id>/delete/", delete_comment),
     path("tags/<str:tag_id>/update/", update_tag),
     path("tags/", list_tags),
     path("tags/<str:tag_id>/delete/", delete_tag),
@@ -154,6 +165,22 @@ urlpatterns = [
     path("admin/donations-stats/", admin_all_churches_donation_stats),
     path("admin/payments-stats/", admin_all_churches_payment_stats),
     path("admin/payments-summary/", admin_payments_summary),
+    path("notifications/", list_notifications, name="list-notifications"),
+    path(
+        "notifications/read-all/",
+        mark_all_notifications_as_read,
+        name="mark-all-notifications-as-read",
+    ),
+    path(
+        "notifications/<str:notification_id>/read/",
+        mark_notification_as_read,
+        name="mark-notification-as-read",
+    ),
+    path(
+        "notifications/preferences/",
+        notification_preferences,
+        name="notification-preferences",
+    ),
     path("books/<str:book_id>/order/", create_book_order, name="create-book-order"),
     path("books/orders/", user_book_orders, name="user-book-orders"),
     path("books/orders/<str:order_id>/", book_order_detail, name="book-order-detail"),
@@ -171,14 +198,15 @@ urlpatterns = [
     path("receipts/<str:receipt_id>/update/", update_receipt, name="update-receipt"),
     path("receipts/<str:receipt_id>/delete/", delete_receipt, name="delete-receipt"),
     # Chat endpoints
-    path("chat/church/<int:church_id>/rooms/", list_create_chat_rooms, name="list-create-chat-rooms"),
-    path("chat/church/<int:church_id>/rooms/create/", list_create_chat_rooms, name="create-chat-room"),
-    path("chat/room/<int:room_id>/", room_detail, name="room-detail"),
-    path("chat/room/<int:room_id>/messages/", list_create_messages, name="list-create-messages"),
-    path("chat/room/<int:room_id>/messages/create/", list_create_messages, name="create-message"),
-    path("chat/room/<int:room_id>/messages/<int:message_id>/", message_detail, name="message-detail"),
-    path("chat/room/<int:room_id>/members/add/", add_member_to_custom_room, name="add-member-to-room"),
-    path("chat/room/<int:room_id>/members/remove/", remove_member_from_custom_room, name="remove-member-from-room"),
+    path("chat/church/<str:church_id>/rooms/", list_create_chat_rooms, name="list-create-chat-rooms"),
+    path("chat/church/<str:church_id>/rooms/create/", list_create_chat_rooms, name="create-chat-room"),
+    path("chat/room/<str:room_id>/", room_detail, name="room-detail"),
+    path("chat/room/<str:room_id>/messages/", list_create_messages, name="list-create-messages"),
+    path("chat/room/<str:room_id>/messages/create/", list_create_messages, name="create-message"),
+    path("chat/room/<str:room_id>/messages/<str:message_id>/", message_detail, name="message-detail"),
+    path("chat/room/<str:room_id>/messages/read/", mark_room_messages_read, name="mark-room-messages-read"),
+    path("chat/room/<str:room_id>/members/add/", add_member_to_custom_room, name="add-member-to-room"),
+    path("chat/room/<str:room_id>/members/remove/", remove_member_from_custom_room, name="remove-member-from-room"),
     
     # Testimony endpoints
     path("church/<str:church_id>/testimonies/", list_church_testimonies, name="list-church-testimonies"),
@@ -238,4 +266,3 @@ urlpatterns = [
 ]
 
 urlpatterns += router.urls
-# eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbl90eXBlIjoiYWNjZXNzIiwiZXhwIjoxNzY0MTE3OTU3LCJpYXQiOjE3NjM1MTMxNTcsImp0aSI6IjQ0OTgyZDY2MWQzNTQxYmQ5YzlmOWY1NmVkZmVjMWE2IiwidXNlcl9pZCI6IjEifQ.eQVbvH6UMV2Ir8Y-AIIwcfetTXz3tngQi60xARO6LpM
